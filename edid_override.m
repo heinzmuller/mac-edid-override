@@ -1,411 +1,348 @@
-// edid_override.m - Inject a custom EDID to unlock high refresh rates on Apple Silicon Macs
-// Build: clang -fmodules -framework Foundation -framework CoreGraphics -framework IOKit -framework AppKit -o edid_override edid_override.m
-//
-// Usage:
-//   ./edid_override                     # Inject EDID and re-enable the daemon if needed
-//   ./edid_override --daemon            # Run as daemon, re-inject on display wake/reconnect
-//   ./edid_override /path/to/edid.bin   # Inject EDID from specified path
-//   ./edid_override --reset             # Stop daemon and clear virtual EDID override
-//   ./edid_override --enable            # Re-enable daemon and inject EDID
-//   ./edid_override --status            # Show current EDID status
-//
+// Runtime EDID override for a single, exactly identified external monitor.
+// No monitor firmware writes. See README for the staged test/enable workflow.
 @import Foundation;
 @import CoreGraphics;
 @import AppKit;
 #include <IOKit/IOKitLib.h>
 #include <dlfcn.h>
-#include <mach-o/dyld.h>
+#include <poll.h>
+#include <unistd.h>
+#include <limits.h>
+#include <signal.h>
 
 typedef CFTypeRef IOAVServiceRef;
 typedef IOAVServiceRef (*CreateFunc)(CFAllocatorRef, io_service_t);
-typedef IOReturn (*SetVEDIDFunc)(IOAVServiceRef, uint32_t, CFDataRef);
-typedef IOReturn (*CopyEDIDFunc)(IOAVServiceRef, CFDataRef *);
+typedef IOReturn (*SetFunc)(IOAVServiceRef, uint32_t, CFDataRef);
+typedef IOReturn (*CopyFunc)(IOAVServiceRef, CFDataRef *);
+static CreateFunc createService;
+static SetFunc setEDID;
+static CopyFunc copyEDID;
+static NSData *targetEDID;
+static BOOL pending;
 
-static void *g_iokit = NULL;
-static NSString *g_edidPath = nil;
-
-static NSString *launchAgentPath(void) {
-    return [NSHomeDirectory() stringByAppendingPathComponent:@"Library/LaunchAgents/com.edid-override.plist"];
+static NSString *installDir(void) { return [NSHomeDirectory() stringByAppendingPathComponent:@".config/edid-override"]; }
+static NSString *installedProfile(void) { return [installDir() stringByAppendingPathComponent:@"edid.bin"]; }
+static NSString *approvalPath(void) { return [installDir() stringByAppendingPathComponent:@"approved-edid.bin"]; }
+static NSString *agentPath(void) { return [NSHomeDirectory() stringByAppendingPathComponent:@"Library/LaunchAgents/com.edid-override.plist"]; }
+static NSString *binaryPath(void) {
+    return NSBundle.mainBundle.executablePath;
 }
+static int fail(NSString *message) { fprintf(stderr, "%s\n", message.UTF8String); return 1; }
 
-static NSString *installDir(void) {
-    return [NSHomeDirectory() stringByAppendingPathComponent:@".config/edid-override"];
-}
-
-static NSString *installedBinaryPath(void) {
-    return [installDir() stringByAppendingPathComponent:@"edid_override"];
-}
-
-static NSString *installedEDIDPath(void) {
-    return [installDir() stringByAppendingPathComponent:@"edid.bin"];
-}
-
-static NSString *currentExecutablePath(void) {
-    uint32_t size = 0;
-    _NSGetExecutablePath(NULL, &size);
-    if (size == 0) {
-        return nil;
-    }
-
-    char *buffer = malloc(size);
-    if (!buffer) {
-        return nil;
-    }
-
-    NSString *result = nil;
-    if (_NSGetExecutablePath(buffer, &size) == 0) {
-        result = [[[NSFileManager defaultManager] stringWithFileSystemRepresentation:buffer length:strlen(buffer)] stringByResolvingSymlinksInPath];
-    }
-    free(buffer);
-    return result;
-}
-
-static BOOL isInstalledBinaryInvocation(void) {
-    NSString *exePath = currentExecutablePath();
-    if (!exePath) {
-        return NO;
-    }
-    return [exePath isEqualToString:[installedBinaryPath() stringByResolvingSymlinksInPath]];
-}
-
-static NSString *launchAgentPlistContent(void) {
-    return [NSString stringWithFormat:
-        @"<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n"
-        "<!DOCTYPE plist PUBLIC \"-//Apple//DTD PLIST 1.0//EN\" "
-        "\"http://www.apple.com/DTDs/PropertyList-1.0.dtd\">\n"
-        "<plist version=\"1.0\">\n"
-        "<dict>\n"
-        "    <key>Label</key>\n"
-        "    <string>com.edid-override</string>\n"
-        "    <key>ProgramArguments</key>\n"
-        "    <array>\n"
-        "        <string>%@</string>\n"
-        "        <string>--daemon</string>\n"
-        "    </array>\n"
-        "    <key>RunAtLoad</key>\n"
-        "    <true/>\n"
-        "    <key>KeepAlive</key>\n"
-        "    <true/>\n"
-        "    <key>StandardOutPath</key>\n"
-        "    <string>/tmp/edid-override.log</string>\n"
-        "    <key>StandardErrorPath</key>\n"
-        "    <string>/tmp/edid-override.log</string>\n"
-        "</dict>\n"
-        "</plist>\n", installedBinaryPath()];
-}
-
-static int ensureLaunchAgentEnabled(void) {
-    NSString *binaryPath = installedBinaryPath();
-    NSString *plistPath = launchAgentPath();
-    NSString *plistContent = launchAgentPlistContent();
-    NSFileManager *fm = [NSFileManager defaultManager];
-
-    if (![fm fileExistsAtPath:binaryPath]) {
-        fprintf(stderr, "edid_override not found at %s\n", binaryPath.UTF8String);
-        fprintf(stderr, "Run install.sh first to compile and install.\n");
-        return 1;
-    }
-
-    NSString *existing = [NSString stringWithContentsOfFile:plistPath encoding:NSUTF8StringEncoding error:nil];
-    if (![existing isEqualToString:plistContent]) {
-        NSString *launchAgentsDir = [plistPath stringByDeletingLastPathComponent];
-        [fm createDirectoryAtPath:launchAgentsDir
-      withIntermediateDirectories:YES
-                       attributes:nil
-                            error:nil];
-
-        NSError *writeError = nil;
-        [plistContent writeToFile:plistPath atomically:YES encoding:NSUTF8StringEncoding error:&writeError];
-        if (writeError) {
-            fprintf(stderr, "Failed to write LaunchAgent: %s\n", writeError.localizedDescription.UTF8String);
-            return 1;
+// Validate the whole container before it reaches the private display API.
+static BOOL validEDID(NSData *data) {
+    const unsigned char header[] = {0,255,255,255,255,255,255,0};
+    if (!data || data.length < 128 || data.length > 32768 || data.length % 128) return NO;
+    const uint8_t *b = data.bytes;
+    if (memcmp(b, header, 8) || (b[126] + 1) * 128 != data.length) return NO;
+    for (NSUInteger off = 0; off < data.length; off += 128) {
+        unsigned sum = 0;
+        for (NSUInteger j = 0; j < 128; j++) sum += b[off+j];
+        if (sum % 256) return NO;
+        if (off && b[off] == 0x70) {
+            // DisplayID section has its own checksum as well as the EDID checksum.
+            NSUInteger end = 5 + b[off+2];
+            if (end > 126) return NO;
+            sum = 0;
+            for (NSUInteger j = 1; j <= end; j++) sum += b[off+j];
+            if (sum % 256) return NO;
         }
     }
-
-    if (system("launchctl list com.edid-override >/dev/null 2>&1") != 0) {
-        NSString *loadCmd = [NSString stringWithFormat:@"launchctl load '%@'", plistPath];
-        if (system(loadCmd.UTF8String) != 0) {
-            fprintf(stderr, "Failed to load LaunchAgent.\n");
-            return 1;
-        }
-        printf("LaunchAgent installed and loaded.\n");
-        printf("EDID override daemon will start automatically.\n");
-    }
-
-    return 0;
+    return YES;
 }
 
-static IOAVServiceRef findExtAVService(void) {
-    CreateFunc pCreate = dlsym(g_iokit, "IOAVServiceCreateWithService");
-    io_iterator_t iter;
-    IOServiceGetMatchingServices(kIOMainPortDefault, IOServiceMatching("DCPAVServiceProxy"), &iter);
+// Manufacturer/product/numeric serial plus serial descriptor, if present.
+// A unique serial is required; matching by model alone is not safe.
+static NSData *identity(NSData *data) {
+    if (!validEDID(data)) return nil;
+    const uint8_t *b = data.bytes;
+    NSMutableData *result = [NSMutableData dataWithBytes:b+8 length:8];
+    BOOL hasSerial = (b[12] || b[13] || b[14] || b[15]) &&
+                     !(b[12] == 255 && b[13] == 255 && b[14] == 255 && b[15] == 255);
+    for (NSUInteger off = 54; off <= 108; off += 18) {
+        if (!b[off] && !b[off+1] && !b[off+2] && b[off+3] == 0xff) {
+            NSMutableData *serial = [NSMutableData data];
+            for (NSUInteger j = off+5; j < off+18 && b[j] != 10; j++) {
+                if (b[j] > 32 && b[j] < 127) [serial appendBytes:b+j length:1];
+            }
+            if (serial.length) { [result appendData:serial]; hasSerial = YES; }
+        }
+    }
+    return hasSerial ? result : nil;
+}
+
+static BOOL loadAPI(void) {
+    void *lib = dlopen("/System/Library/Frameworks/IOKit.framework/IOKit", RTLD_NOW);
+    if (!lib) return NO;
+    createService = (CreateFunc)dlsym(lib, "IOAVServiceCreateWithService");
+    setEDID = (SetFunc)dlsym(lib, "IOAVServiceSetVirtualEDIDMode");
+    copyEDID = (CopyFunc)dlsym(lib, "IOAVServiceCopyEDID");
+    return createService && setEDID && copyEDID;
+}
+
+// Return a retained service only when exactly one connected external monitor matches.
+static IOAVServiceRef findTarget(void) {
+    io_iterator_t iter = IO_OBJECT_NULL;
+    if (IOServiceGetMatchingServices(kIOMainPortDefault, IOServiceMatching("DCPAVServiceProxy"), &iter) != KERN_SUCCESS) return NULL;
     IOAVServiceRef result = NULL;
+    unsigned matches = 0;
     io_service_t s;
     while ((s = IOIteratorNext(iter)) != IO_OBJECT_NULL) {
-        CFMutableDictionaryRef props = NULL;
-        IORegistryEntryCreateCFProperties(s, &props, kCFAllocatorDefault, 0);
-        if (props) {
-            CFStringRef loc = CFDictionaryGetValue(props, CFSTR("Location"));
-            if (loc && CFStringCompare(loc, CFSTR("External"), 0) == kCFCompareEqualTo) {
-                result = pCreate(kCFAllocatorDefault, s);
+        CFTypeRef location = IORegistryEntryCreateCFProperty(s, CFSTR("Location"), kCFAllocatorDefault, 0);
+        if (location && CFGetTypeID(location) == CFStringGetTypeID() && CFEqual(location, CFSTR("External"))) {
+            IOAVServiceRef service = createService(kCFAllocatorDefault, s);
+            if (service) {
+                CFDataRef current = NULL;
+                if (copyEDID(service, &current) == KERN_SUCCESS && current &&
+                    [identity((__bridge NSData *)current) isEqualToData:identity(targetEDID)]) {
+                    matches++;
+                    if (!result) result = CFRetain(service);
+                }
+                if (current) CFRelease(current);
+                CFRelease(service);
             }
-            CFRelease(props);
         }
+        if (location) CFRelease(location);
         IOObjectRelease(s);
-        if (result) break;
     }
     IOObjectRelease(iter);
+    if (matches != 1 && result) { CFRelease(result); result = NULL; }
     return result;
 }
 
-static int doInject(const char *edidPath) {
-    SetVEDIDFunc setVEDID = dlsym(g_iokit, "IOAVServiceSetVirtualEDIDMode");
-    CopyEDIDFunc copyEDID = dlsym(g_iokit, "IOAVServiceCopyEDID");
+static int resetTarget(void) {
+    IOAVServiceRef service = findTarget();
+    if (!service) return fail(@"Target absent, unreadable or ambiguous; no display was changed.");
+    IOReturn r = setEDID(service, 0, NULL);
+    CFRelease(service);
+    return r == KERN_SUCCESS ? 0 : fail(@"Failed to restore factory EDID.");
+}
 
-    NSString *path = [[NSString stringWithUTF8String:edidPath] stringByExpandingTildeInPath];
-    NSData *edidFile = [NSData dataWithContentsOfFile:path];
-    if (!edidFile) {
-        fprintf(stderr, "Cannot read EDID file: %s\n", path.UTF8String);
-        return 1;
+static int inject(void) {
+    IOAVServiceRef service = findTarget();
+    if (!service) { fail(@"Target absent, unreadable or ambiguous; no display was changed."); return 2; }
+    CFDataRef before = NULL;
+    if (copyEDID(service, &before) != KERN_SUCCESS || !before) {
+        if (before) CFRelease(before);
+        CFRelease(service);
+        return fail(@"Cannot read current EDID; refusing to change it.");
     }
-    CFDataRef edidCF = CFDataCreate(kCFAllocatorDefault, edidFile.bytes, edidFile.length);
-    printf("EDID: %lu bytes from %s\n", (unsigned long)edidFile.length, path.UTF8String);
-
-    IOAVServiceRef avSvc = findExtAVService();
-    if (!avSvc) {
-        fprintf(stderr, "No external display found.\n");
-        CFRelease(edidCF);
-        return 1;
+    if ([(__bridge NSData *)before isEqualToData:targetEDID]) {
+        CFRelease(before); CFRelease(service); return 0;
     }
-
-    // Check if already injected
-    CFDataRef current = NULL;
-    copyEDID(avSvc, &current);
-    if (current) {
-        NSData *curData = (__bridge NSData *)current;
-        if ([curData isEqualToData:edidFile]) {
-            printf("EDID already active, skipping.\n");
-            CFRelease(current);
-            CFRelease(edidCF);
-            return 0;
-        }
-        CFRelease(current);
+    CFRelease(before);
+    // No preliminary reset: a failed new apply must not first erase the working state.
+    IOReturn r = setEDID(service, 1, (__bridge CFDataRef)targetEDID);
+    if (r != KERN_SUCCESS) {
+        CFRelease(service); return fail(@"EDID apply failed.");
     }
+    CFDataRef after = NULL;
+    r = copyEDID(service, &after);
+    BOOL verified = r == KERN_SUCCESS && after && [(__bridge NSData *)after isEqualToData:targetEDID];
+    if (after) CFRelease(after);
+    if (!verified) setEDID(service, 0, NULL);
+    CFRelease(service);
+    return verified ? 0 : fail(@"EDID readback did not match; attempted factory reset.");
+}
 
-    // Reset any existing override first
-    setVEDID(avSvc, 0, NULL);
-    usleep(500000);
+static int launchctl(NSArray<NSString *> *args) {
+    NSTask *task = [NSTask new];
+    task.executableURL = [NSURL fileURLWithPath:@"/bin/launchctl"];
+    task.arguments = args;
+    NSError *error = nil;
+    if (![task launchAndReturnError:&error]) return fail(error.localizedDescription);
+    [task waitUntilExit];
+    return task.terminationStatus;
+}
+static BOOL approved(void) {
+    return [targetEDID isEqualToData:[NSData dataWithContentsOfFile:approvalPath()]];
+}
+static int enableAgent(void) {
+    if (!approved()) return fail(@"Profile not approved. Run --test and confirm the picture first.");
+    NSString *installedBinary = [installDir() stringByAppendingPathComponent:@"edid_override"];
+    if (![[binaryPath() stringByResolvingSymlinksInPath] isEqualToString:[installedBinary stringByResolvingSymlinksInPath]])
+        return fail(@"Enable must be run from the installed binary.");
+    NSDictionary *agent = @{@"Label":@"com.edid-override", @"ProgramArguments":@[installedBinary,@"--daemon"],
+                           @"RunAtLoad":@YES};
+    NSFileManager *fm = NSFileManager.defaultManager;
+    [fm createDirectoryAtPath:agentPath().stringByDeletingLastPathComponent withIntermediateDirectories:YES attributes:nil error:nil];
+    if (![agent writeToFile:agentPath() atomically:YES]) return fail(@"Cannot write LaunchAgent.");
+    NSString *domain = [NSString stringWithFormat:@"gui/%u",getuid()];
+    NSString *label = [domain stringByAppendingString:@"/com.edid-override"];
+    // Do not start a second instance or create concurrent injectors.
+    if (launchctl(@[@"print", label]) == 0) return 0;
+    return launchctl(@[@"bootstrap", domain, agentPath()]);
+}
 
-    // Inject
-    IOReturn r = setVEDID(avSvc, 1, edidCF);
-    if (r != 0) {
-        fprintf(stderr, "Injection failed: 0x%x\n", r);
-        CFRelease(edidCF);
-        return 1;
+static BOOL confirmed(int fd, int timeout) {
+    struct pollfd input = {fd, POLLIN, 0};
+    char c = 0;
+    return poll(&input,1,timeout)>0 && read(fd,&c,1)==1 && c=='K';
+}
+// Separate process: EOF (parent exits/crashes) or 45 seconds triggers factory reset.
+static int watchdog(void) {
+    if (write(STDOUT_FILENO,"R",1) != 1) return 1;
+    if (confirmed(STDIN_FILENO,45000)) return 0;
+    fprintf(stderr,"Test not confirmed; restoring factory EDID.\n");
+    resetTarget();
+    return 1; // A timed-out test is never a successful confirmation.
+}
+static int testProfile(NSString *path) {
+    if (!isatty(STDIN_FILENO)) return fail(@"--test requires an interactive terminal for confirmation.");
+    NSString *label = [NSString stringWithFormat:@"gui/%u/com.edid-override", getuid()];
+    if (launchctl(@[@"print",label]) == 0) return fail(@"Stop the installed daemon with --reset before testing.");
+    // Clear stale approval before applying any new test.
+    [NSFileManager.defaultManager removeItemAtPath:approvalPath() error:nil];
+    // Give the watchdog the same immutable bytes, not a mutable user-supplied path.
+    (void)path;
+    NSString *snapshotDir = [NSTemporaryDirectory() stringByAppendingPathComponent:NSUUID.UUID.UUIDString];
+    if (![NSFileManager.defaultManager createDirectoryAtPath:snapshotDir withIntermediateDirectories:NO attributes:@{NSFilePosixPermissions:@0700} error:nil]) return fail(@"Cannot create watchdog snapshot.");
+    NSString *snapshot = [snapshotDir stringByAppendingPathComponent:@"edid.bin"];
+    if (![targetEDID writeToFile:snapshot options:NSDataWritingAtomic error:nil]) {
+        [NSFileManager.defaultManager removeItemAtPath:snapshotDir error:nil];
+        return fail(@"Cannot save watchdog snapshot.");
     }
-    printf("EDID injected successfully.\n");
-
-    // Verify
-    CFDataRef readBack = NULL;
-    copyEDID(avSvc, &readBack);
-    if (readBack) {
-        NSData *cur = (__bridge NSData *)readBack;
-        if ([cur isEqualToData:edidFile]) {
-            printf("Verified: EDID matches.\n");
-        } else {
-            printf("Warning: EDID readback doesn't match.\n");
-        }
-        CFRelease(readBack);
+    NSTask *guard = [NSTask new];
+    NSPipe *pipe = [NSPipe pipe];
+    NSPipe *readyPipe = [NSPipe pipe];
+    guard.executableURL = [NSURL fileURLWithPath:binaryPath()];
+    guard.arguments = @[@"--watchdog", snapshot];
+    guard.standardInput = pipe;
+    guard.standardOutput = readyPipe;
+    NSError *error = nil;
+    if (![guard launchAndReturnError:&error]) {
+        [NSFileManager.defaultManager removeItemAtPath:snapshotDir error:nil];
+        return fail(error.localizedDescription);
     }
-
-    CFRelease(edidCF);
+    struct pollfd ready = {readyPipe.fileHandleForReading.fileDescriptor, POLLIN, 0};
+    char marker = 0;
+    BOOL armed = poll(&ready,1,5000) > 0 && read(ready.fd,&marker,1) == 1 && marker == 'R';
+    [NSFileManager.defaultManager removeItemAtPath:snapshotDir error:nil];
+    if (!armed) {
+        [pipe.fileHandleForWriting closeFile];
+        [guard terminate]; [guard waitUntilExit];
+        return fail(@"Watchdog did not become ready; no display was changed.");
+    }
+    if (inject() != 0) {
+        [pipe.fileHandleForWriting closeFile]; [guard waitUntilExit]; return 1;
+    }
+    printf("Select the desired mode in Displays. Within 35 seconds, type KEEP and Enter only if the picture is stable.\n");
+    fflush(stdout);
+    struct pollfd fd = {STDIN_FILENO, POLLIN, 0};
+    char answer[16] = {0};
+    BOOL keep = poll(&fd, 1, 35000) > 0 && fgets(answer,sizeof(answer),stdin) && strcmp(answer,"KEEP\n") == 0;
+    if (keep && guard.running) {
+        signal(SIGPIPE, SIG_IGN);
+        keep = [pipe.fileHandleForWriting writeData:[NSData dataWithBytes:"K" length:1] error:nil];
+    } else keep = NO;
+    [pipe.fileHandleForWriting closeFile];
+    [guard waitUntilExit];
+    if (!keep || guard.terminationStatus != 0) {
+        [NSFileManager.defaultManager removeItemAtPath:approvalPath() error:nil];
+        return fail(@"Test not approved. Automatic startup remains disabled.");
+    }
+    [NSFileManager.defaultManager createDirectoryAtPath:installDir() withIntermediateDirectories:YES attributes:@{NSFilePosixPermissions:@0700} error:nil];
+    if (![targetEDID writeToFile:approvalPath() options:NSDataWritingAtomic error:nil]) {
+        resetTarget(); return fail(@"Cannot save approval; attempted factory reset.");
+    }
+    puts("Test approved. Automatic startup is still disabled; --enable is a separate step.");
     return 0;
 }
 
-static int doReset(void) {
-    // Stop the daemon first so it doesn't re-inject the EDID
-    NSString *plistPath = launchAgentPath();
-    int stopped = 0;
-    if ([[NSFileManager defaultManager] fileExistsAtPath:plistPath]) {
-        printf("Stopping EDID override daemon...\n");
-        NSString *cmd = [NSString stringWithFormat:@"launchctl unload '%@' 2>/dev/null", plistPath];
-        system(cmd.UTF8String);
-        stopped = 1;
-        usleep(500000);
-    }
-
-    SetVEDIDFunc setVEDID = dlsym(g_iokit, "IOAVServiceSetVirtualEDIDMode");
-    IOAVServiceRef avSvc = findExtAVService();
-    if (!avSvc) {
-        fprintf(stderr, "No external display found.\n");
-        return 1;
-    }
-    IOReturn r = setVEDID(avSvc, 0, NULL);
-    if (r == 0) {
-        printf("Virtual EDID override cleared.\n");
-        if (stopped) {
-            printf("To re-enable, run: %s/edid_override\n", installDir().UTF8String);
-        }
-        return 0;
-    } else {
-        fprintf(stderr, "Reset failed: 0x%x\n", r);
-        return 1;
+static void backgroundCheck(void) {
+    // Missing/ambiguous target is harmless. A real apply/readback failure stops
+    // automatic attempts instead of repeatedly blanking the screen.
+    if (inject()==1) {
+        [NSFileManager.defaultManager removeItemAtPath:approvalPath() error:nil];
+        fprintf(stderr,"Automatic apply stopped after failure; test again before enabling.\n");
+        exit(0);
     }
 }
-
-static int doEnable(void) {
-    if (ensureLaunchAgentEnabled() != 0) {
-        return 1;
-    }
-    return doInject(installedEDIDPath().UTF8String);
+static void scheduleCheck(void) {
+    if (pending) return;
+    pending = YES;
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, NSEC_PER_SEC), dispatch_get_main_queue(), ^{
+        @autoreleasepool { pending = NO; backgroundCheck(); }
+    });
 }
-
-static int doStatus(void) {
-    CopyEDIDFunc copyEDID = dlsym(g_iokit, "IOAVServiceCopyEDID");
-    IOAVServiceRef avSvc = findExtAVService();
-    if (!avSvc) {
-        fprintf(stderr, "No external display found.\n");
-        return 1;
-    }
-    CFDataRef edid = NULL;
-    IOReturn r = copyEDID(avSvc, &edid);
-    if (r == 0 && edid) {
-        long len = CFDataGetLength(edid);
-        printf("External display EDID: %ld bytes\n", len);
-        NSString *edidPath = [@"~/.config/edid-override/edid.bin" stringByExpandingTildeInPath];
-        NSData *installed = [NSData dataWithContentsOfFile:edidPath];
-        NSData *current = (__bridge NSData *)edid;
-        if (installed && [current isEqualToData:installed]) {
-            printf("Status: Custom EDID override is ACTIVE\n");
-        } else {
-            printf("Status: Factory EDID (no override)\n");
-        }
-        CFRelease(edid);
-    } else {
-        fprintf(stderr, "Cannot read EDID: 0x%x\n", r);
-        return 1;
-    }
-    return 0;
+static void changed(CGDirectDisplayID d, CGDisplayChangeSummaryFlags flags, void *ctx) {
+    (void)d; (void)ctx;
+    if (!(flags & kCGDisplayBeginConfigurationFlag)) scheduleCheck();
 }
-
-// Callback for display reconfiguration events (wake, plug, etc.)
-static void displayReconfigCallback(CGDirectDisplayID display, CGDisplayChangeSummaryFlags flags, void *context) {
-    // Try re-injection on any meaningful display change
-    if (flags & kCGDisplayBeginConfigurationFlag) {
-        return; // Wait for the end of reconfiguration
-    }
-
-    // Stagger retries: try at 1s, 3s, and 5s after the event
-    // The display may not be ready immediately, especially in clamshell mode
-    int delays[] = {1, 3, 5};
-    for (int i = 0; i < 3; i++) {
-        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(delays[i] * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
-            doInject(g_edidPath.UTF8String);
-        });
-    }
-}
-
-// Objective-C helper for NSWorkspace wake notifications
 @interface WakeObserver : NSObject
 @end
-
 @implementation WakeObserver
-- (void)onWake:(NSNotification *)note {
-    printf("[%s] System wake detected, re-injecting EDID...\n",
-           [NSDate.now descriptionWithLocale:nil].UTF8String);
-    // Stagger retries after wake — display may take a moment to be ready
-    int delays[] = {1, 3, 5, 8};
-    for (int i = 0; i < 4; i++) {
-        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(delays[i] * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
-            doInject(g_edidPath.UTF8String);
-        });
-    }
-}
-
-- (void)onDisplayWake:(NSNotification *)note {
-    printf("[%s] Screens wake detected, re-injecting EDID...\n",
-           [NSDate.now descriptionWithLocale:nil].UTF8String);
-    int delays[] = {1, 3, 5};
-    for (int i = 0; i < 3; i++) {
-        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(delays[i] * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
-            doInject(g_edidPath.UTF8String);
-        });
-    }
-}
+- (void)wake:(NSNotification *)note { scheduleCheck(); }
 @end
-
-static int doDaemon(const char *edidPath) {
-    g_edidPath = [[NSString stringWithUTF8String:edidPath] stringByExpandingTildeInPath];
-    printf("Starting EDID override daemon...\n");
-    printf("EDID: %s\n", g_edidPath.UTF8String);
-
-    // Initial injection
-    doInject(edidPath);
-
-    // Register for display change notifications
-    CGDisplayRegisterReconfigurationCallback(displayReconfigCallback, NULL);
-
-    // Register for system wake notifications (works in clamshell mode)
-    WakeObserver *observer = [[WakeObserver alloc] init];
-    [[[NSWorkspace sharedWorkspace] notificationCenter]
-        addObserver:observer
-        selector:@selector(onWake:)
-        name:NSWorkspaceDidWakeNotification
-        object:nil];
-    [[[NSWorkspace sharedWorkspace] notificationCenter]
-        addObserver:observer
-        selector:@selector(onDisplayWake:)
-        name:NSWorkspaceScreensDidWakeNotification
-        object:nil];
-
-    printf("Watching for display changes and system wake...\n");
-
-    // Safety net: check every 5 seconds
-    dispatch_source_t timer = dispatch_source_create(DISPATCH_SOURCE_TYPE_TIMER, 0, 0, dispatch_get_main_queue());
-    dispatch_source_set_timer(timer, dispatch_time(DISPATCH_TIME_NOW, 5 * NSEC_PER_SEC), 5 * NSEC_PER_SEC, 1 * NSEC_PER_SEC);
-    dispatch_source_set_event_handler(timer, ^{
-        CopyEDIDFunc copyEDID = dlsym(g_iokit, "IOAVServiceCopyEDID");
-        IOAVServiceRef avSvc = findExtAVService();
-        if (avSvc) {
-            CFDataRef current = NULL;
-            copyEDID(avSvc, &current);
-            if (current) {
-                NSData *installed = [NSData dataWithContentsOfFile:g_edidPath];
-                NSData *curData = (__bridge NSData *)current;
-                if (installed && ![curData isEqualToData:installed]) {
-                    printf("[%s] EDID mismatch detected, re-injecting...\n",
-                           [NSDate.now descriptionWithLocale:nil].UTF8String);
-                    doInject(g_edidPath.UTF8String);
-                }
-                CFRelease(current);
-            }
-        }
-    });
-    dispatch_resume(timer);
-
-    // Run the main loop forever
-    [[NSRunLoop mainRunLoop] run];
+static int daemonMode(void) {
+    if (!approved()) return fail(@"Unapproved profile; daemon will not apply it.");
+    backgroundCheck();
+    CGDisplayRegisterReconfigurationCallback(changed,NULL);
+    WakeObserver *observer = [WakeObserver new];
+    NSNotificationCenter *nc = NSWorkspace.sharedWorkspace.notificationCenter;
+    [nc addObserver:observer selector:@selector(wake:) name:NSWorkspaceDidWakeNotification object:nil];
+    [nc addObserver:observer selector:@selector(wake:) name:NSWorkspaceScreensDidWakeNotification object:nil];
+    NSTimer *timer = [NSTimer scheduledTimerWithTimeInterval:30 repeats:YES block:^(NSTimer *t) {
+        @autoreleasepool { (void)t; backgroundCheck(); }
+    }];
+    (void)timer;
+    [NSRunLoop.mainRunLoop run];
     return 0;
 }
 
+static int selfTest(void) {
+    NSMutableData *fixture = [NSMutableData dataWithLength:128];
+    uint8_t *b = fixture.mutableBytes;
+    memset(b+1,255,6); b[8]=0x10; b[9]=0xac; b[10]=0xfd; b[11]=0xa2; b[12]=1;
+    unsigned sum=0; for(int i=0;i<127;i++) sum+=b[i]; b[127]=(uint8_t)-sum;
+    if (!validEDID(fixture) || !identity(fixture) || validEDID([NSData data])) return 1;
+    NSData *id1 = identity(fixture);
+    b[12]=2; b[127]--; if ([identity(fixture) isEqualToData:id1]) return 1;
+    b[126]=1; b[127]--; if (validEDID(fixture)) return 1;
+    b[126]=0; b[127]++; b[20]++; if (validEDID(fixture)) return 1;
+    int fds[2];
+    if (pipe(fds)) return 1;
+    if (confirmed(fds[0],0)) return 1; // No confirmation / timeout.
+    if (write(fds[1],"N",1)!=1 || confirmed(fds[0],0)) return 1;
+    if (write(fds[1],"K",1)!=1 || !confirmed(fds[0],0)) return 1;
+    close(fds[1]);
+    if (confirmed(fds[0],0)) return 1; // EOF / parent crash.
+    close(fds[0]);
+    puts("Validation, identity and watchdog confirmation self-tests passed."); return 0;
+}
 int main(int argc, const char *argv[]) {
     @autoreleasepool {
-        g_iokit = dlopen("/System/Library/Frameworks/IOKit.framework/IOKit", RTLD_NOW);
-
-        if (argc > 1) {
-            if (strcmp(argv[1], "--reset") == 0) return doReset();
-            if (strcmp(argv[1], "--enable") == 0) return doEnable();
-            if (strcmp(argv[1], "--status") == 0) return doStatus();
-            if (strcmp(argv[1], "--daemon") == 0) {
-                const char *path = (argc > 2) ? argv[2] : "~/.config/edid-override/edid.bin";
-                return doDaemon(path);
-            }
-            return doInject(argv[1]);
+        NSString *mode = argc>1 ? @(argv[1]) : @"--help";
+        if ([mode isEqualToString:@"--self-test"]) return selfTest();
+        if ([mode isEqualToString:@"--help"]) {
+            puts("Usage: edid_override --validate FILE | --test FILE | --enable | --reset | --status | --self-test\nInstall stages files only. Test requires interactive confirmation. Enable is opt-in."); return 0;
         }
-
-        if (isInstalledBinaryInvocation()) {
-            return doEnable();
+        if (![@[@"--validate",@"--test",@"--watchdog",@"--enable",@"--reset",@"--status",@"--daemon"] containsObject:mode]) return fail(@"Unknown command; use --help.");
+        BOOL needsFile = [@[@"--validate",@"--test",@"--watchdog"] containsObject:mode];
+        if (argc != (needsFile ? 3 : 2)) return fail(@"Wrong argument count; use --help.");
+        NSString *path = needsFile ? [@(argv[2]) stringByStandardizingPath] : installedProfile();
+        targetEDID = [NSData dataWithContentsOfFile:path];
+        if (!validEDID(targetEDID) || !identity(targetEDID)) return fail(@"Invalid EDID or no unique serial; no display was changed.");
+        if ([mode isEqualToString:@"--validate"]) { puts("EDID structure, checksums and target identity validated."); return 0; }
+        if (!loadAPI()) return fail(@"Required macOS display functions unavailable; no display was changed.");
+        if ([mode isEqualToString:@"--watchdog"]) return watchdog();
+        if ([mode isEqualToString:@"--test"]) return testProfile(path);
+        if ([mode isEqualToString:@"--enable"]) return enableAgent();
+        if ([mode isEqualToString:@"--daemon"]) return daemonMode();
+        if ([mode isEqualToString:@"--reset"]) {
+            NSString *service = [NSString stringWithFormat:@"gui/%u/com.edid-override",getuid()];
+            if (launchctl(@[@"print",service]) == 0 && launchctl(@[@"bootout",service]) != 0) return fail(@"Could not stop daemon; reset aborted.");
+            [NSFileManager.defaultManager removeItemAtPath:approvalPath() error:nil];
+            return resetTarget();
         }
-        return doInject("~/.config/edid-override/edid.bin");
+        IOAVServiceRef service = findTarget();
+        if (!service) return fail(@"Target absent, unreadable or ambiguous.");
+        CFDataRef current = NULL;
+        IOReturn r = copyEDID(service,&current);
+        BOOL active = r == KERN_SUCCESS && current && [(__bridge NSData *)current isEqualToData:targetEDID];
+        BOOL readable = r == KERN_SUCCESS && current != NULL;
+        if(current) CFRelease(current); CFRelease(service);
+        puts(active ? "Custom EDID active." : "Custom EDID not active.");
+        return readable ? 0 : 1;
     }
 }

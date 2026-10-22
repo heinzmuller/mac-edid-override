@@ -1,34 +1,21 @@
 #!/bin/bash
-set -e
-
+set -euo pipefail
 INSTALL_DIR="$HOME/.config/edid-override"
 LAUNCH_AGENT="$HOME/Library/LaunchAgents/com.edid-override.plist"
-
-echo "=== mac-edid-override uninstaller ==="
-echo ""
-
-# Reset virtual EDID
-if [ -f "$INSTALL_DIR/edid_override" ]; then
-    echo "Resetting EDID override..."
-    "$INSTALL_DIR/edid_override" --reset 2>/dev/null || true
+if [ "$EUID" -eq 0 ]; then echo 'Run as your normal user, without sudo.' >&2; exit 1; fi
+if [ -L "$INSTALL_DIR" ]; then echo 'Refusing a symlinked installation directory.' >&2; exit 1; fi
+service="gui/$(id -u)/com.edid-override"
+# Stop persistence even if the binary/profile is missing or invalid.
+if launchctl print "$service" >/dev/null 2>&1; then
+    launchctl bootout "$service"
 fi
-
-# Unload and remove LaunchAgent
-if [ -f "$LAUNCH_AGENT" ]; then
-    echo "Removing LaunchAgent..."
-    launchctl unload "$LAUNCH_AGENT" 2>/dev/null || true
-    rm "$LAUNCH_AGENT"
-    echo "  Removed"
+if [ -x "$INSTALL_DIR/edid_override" ]; then
+    if ! "$INSTALL_DIR/edid_override" --reset; then
+        echo 'Factory reset could not be verified. Reconnect the display or restart after uninstall.' >&2
+    fi
+else
+    echo 'No reset binary found. Reconnect the display or restart to clear any runtime override.' >&2
 fi
-
-# Remove install directory
-if [ -d "$INSTALL_DIR" ]; then
-    echo "Removing $INSTALL_DIR..."
-    rm -rf "$INSTALL_DIR"
-    echo "  Removed"
-fi
-
-echo ""
-echo "=== Uninstall complete ==="
-echo "EDID override has been removed. Your display will use factory settings."
-echo "You may need to restart or replug your display cable for changes to take effect."
+rm -f "$LAUNCH_AGENT"
+rm -rf "$INSTALL_DIR"
+echo 'Startup service and installed files removed.'
