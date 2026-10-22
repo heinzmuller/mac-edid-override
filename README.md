@@ -76,9 +76,9 @@ The uninstaller stops the service even if the binary/profile is damaged, attempt
 ./tests.sh
 ```
 
-This builds both programs with warnings treated as errors, runs validation/identity/watchdog-decision self-tests, rejects malformed fixtures, and validates bundled example profiles. It does not install anything, call a display-changing API or register a service.
+This builds both programs with warnings treated as errors, runs validation/identity/watchdog-decision self-tests, rejects malformed fixtures, and validates generated dummy profiles. It does not install anything, call a display-changing API or register a service.
 
-The files in `edids/` are **upstream U4025QW examples**, not profiles to apply to an Alienware or another monitor.
+No real monitor EDIDs are bundled. Tests generate synthetic profiles with dummy identities in a temporary directory and remove them afterward. Supply your own monitor’s profile locally; test fixtures are not display configurations.
 
 ## License
 
